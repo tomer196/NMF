@@ -1,0 +1,6 @@
+numpy>=1.20.0
+matplotlib>=3.3.0
+pandas
+torch
+scikit-learn
+pip install git+https://github.com/patrick-kidger/torchcubicspline.git
