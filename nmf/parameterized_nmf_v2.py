@@ -51,7 +51,7 @@ class MatrixParameterization(ABC, nn.Module):
         """Get the current matrix."""
         return self.forward()
 
-    def initialize_from_matrix(self, target_matrix, n_iterations=500, lr=0.1, patience=50):
+    def initialize_from_matrix(self, target_matrix, n_iterations=1000, lr=0.1, patience=100):
         """
         Initialize parameters by fitting to a target matrix using optimization.
         
@@ -2187,10 +2187,13 @@ class CompositeLoss(LossFunction):
     Composite loss that combines multiple loss functions with weights.
     
     Args:
-        losses: list of tuples (loss_function, weight, name)
+        losses: list of tuples (loss_function, weight, name, dynamic_penalty)
             - loss_function: LossFunction instance
             - weight: float - weight for this loss component
             - name: str - name for this loss component (for tracking)
+            - dynamic_penalty: bool - if True, weight increases from weight/100 to weight
+                                     over the first 2/3 of iterations (default: False).
+                                     First loss weight is constant, subsequent penalties ramp up to allow initial fitting before enforcing constraints.
     """
     
     def __init__(self, losses: list):
@@ -2198,7 +2201,8 @@ class CompositeLoss(LossFunction):
         Initialize composite loss.
         
         Args:
-            losses: list of tuples (loss_function, weight, name)
+            losses: list of tuples (loss_function, weight, name) or 
+                    (loss_function, weight, name, dynamic_penalty)
         """
         self.losses = losses
         self.loss_dict = {}
@@ -2207,6 +2211,7 @@ class CompositeLoss(LossFunction):
                 iteration: int, total_iterations: int) -> torch.Tensor:
         """
         Compute weighted sum of all losses.
+        Penalty weights increase from 1/100 to full weight over first 1/2 of iterations.
         
         Returns:
             torch.Tensor - Total weighted loss
@@ -2214,9 +2219,30 @@ class CompositeLoss(LossFunction):
         total_loss = 0.0
         self.loss_dict = {}
         
-        for loss_fn, weight, name in self.losses:
+        for loss_spec in self.losses:
+            # Handle both 3-tuple and 4-tuple formats
+            if len(loss_spec) == 4:
+                loss_fn, weight, name, dynamic_penalty = loss_spec
+            else:
+                loss_fn, weight, name = loss_spec
+                dynamic_penalty = False
+            
+            # Compute penalty weight multiplier (increases from 0.01 to 1.0)
+            if dynamic_penalty:
+                # Increase linearly from 1/100 to 1 over first 1/2 of iterations
+                warmup_iters = int(0.5 * total_iterations)
+                if iteration < warmup_iters:
+                    # Linear schedule from 0.01 to 1.0
+                    multiplier = 0.01 + 0.99 * (iteration / warmup_iters)
+                else:
+                    multiplier = 1.0
+                effective_weight = weight * multiplier
+            else:
+                effective_weight = weight
+                multiplier = 1.0
+            
             loss_value = loss_fn(W, H, A_observed, iteration, total_iterations)
-            weighted_loss = weight * loss_value
+            weighted_loss = effective_weight * loss_value
             total_loss = total_loss + weighted_loss
             self.loss_dict[name] = loss_value
         
@@ -2236,7 +2262,7 @@ class ParameterizedNMFSolver:
     NMF Solver using parameterized matrices for W and H.
     """
     def __init__(self, W_param: MatrixParameterization, H_param: MatrixParameterization, 
-                 A_observed: torch.Tensor, loss_function, device: str = 'cpu', freeze_h=False,
+                 A_observed: torch.Tensor, loss_function, device: str = 'cpu',
                  ):
         """
         Initialize the NMF solver.
@@ -2247,20 +2273,15 @@ class ParameterizedNMFSolver:
             A_observed: torch.Tensor - observed matrix to factorize
             lambda_penalty: float - penalty weight for sum constraint
             device: str or torch.device - device to run on
-            freeze_h: bool - whether to freeze H matrix during optimization
         """
         self.W_param = W_param.to(device)
         self.H_param = H_param.to(device)
         self.A_observed = A_observed.to(device)
         self.loss_function = loss_function
         self.device = device
-        self.freeze_h = freeze_h
         
         # Collect all parameters from both parameterizations
-        if self.freeze_h:
-            self.params = list(self.W_param.parameters())
-        else:
-            self.params = list(self.W_param.parameters()) + list(self.H_param.parameters())
+        self.params = list(self.W_param.parameters()) + list(self.H_param.parameters())
         
         # Tracking
         self.best_loss = float('inf')
@@ -2269,7 +2290,7 @@ class ParameterizedNMFSolver:
         self.best_params = None
         self.loss_history = []
     
-    def initialize_with_nmf(self, n_nmf_iterations=500):
+    def initialize_with_nmf(self, n_nmf_iterations=10000, print_every=1000):
         """
         Initialize parameters using standard NMF.
         
@@ -2305,7 +2326,7 @@ class ParameterizedNMFSolver:
         W_raw = nn.Parameter(torch.randn(N_rows, k, device=self.device))
         H_raw = nn.Parameter(torch.randn(k, N_cols, device=self.device))
         init_lr = 1.0
-        optimizer = optim.AdamW([W_raw, H_raw], lr=init_lr, weight_decay=1e-5)
+        optimizer = optim.AdamW([W_raw, H_raw], lr=0.1, weight_decay=1e-5)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=50, min_lr=1e-4
         )
@@ -2352,7 +2373,7 @@ class ParameterizedNMFSolver:
                     best_H_init = H_init.detach().clone()
                     best_iteration = iteration
             
-            if (iteration + 1) % 10000 == 0:
+            if (iteration + 1) % print_every == 0:
                 loss_str = f"  NMF iteration {iteration+1}/{n_nmf_iterations}, Total Loss: {total_loss.item():.6f}"
                 if losses:
                     for name, value in losses.items():
@@ -2384,33 +2405,33 @@ class ParameterizedNMFSolver:
         else:
             print(f"Parameterized approximation - Total: {total_loss.item():.6f}\n")
     
-    def solve(self, n_iterations=1000, lr=0.01, print_every=10, use_scheduler=True, 
-              nmf_init=False, n_nmf_iterations=500):
+    def solve_single(self, n_iterations=1000, lr=0.01, print_every=10, use_scheduler=True, 
+                     nmf_init=True, n_nmf_iterations=500):
         """
-        Solve the NMF problem using gradient-based optimization.
+        Solve the NMF problem using gradient-based optimization with a single initialization.
         
         Args:
             n_iterations: int - number of optimization iterations
             lr: float - initial learning rate
             print_every: int - print loss every N iterations
             use_scheduler: bool - whether to use learning rate scheduler (Adam only)
-            nmf_init: bool - whether to initialize with standard NMF
-            n_nmf_iterations: int - number of NMF iterations if nmf_init=True
+            nmf_init: bool - whether to initialize with NMF (True) or random (False)
+            n_nmf_iterations: int - number of NMF iterations for initialization (only used if nmf_init=True)
         
         Returns:
             tuple: (W_final, H_final, loss_history)
         """
-        # Initialize with NMF if requested
+        # Initialize parameters
         if nmf_init:
-            self.initialize_with_nmf(n_nmf_iterations=n_nmf_iterations)
+            self.initialize_with_nmf(n_nmf_iterations, print_every)
         
         # Create optimizer
         optimizer = optim.AdamW(self.params, lr=lr, weight_decay=1e-5)
         
-        # Create learning rate scheduler (Adam only)
+        # Create learning rate scheduler
         if use_scheduler:
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=500, min_lr=1e-6
+                optimizer, mode='min', factor=0.3, patience=1000, min_lr=1e-4
             )
         
         print(f"Starting optimization for {n_iterations} iterations...")
@@ -2419,7 +2440,7 @@ class ParameterizedNMFSolver:
         print("-" * 70)
         
         current_lr = lr
-        iteration = 0
+        
         for iteration in range(n_iterations):
             optimizer.zero_grad()
             
@@ -2464,10 +2485,16 @@ class ParameterizedNMFSolver:
             
             # Print progress
             if (iteration + 1) % print_every == 0 or iteration == 0:
-                lr_str = f"LR: {current_lr:.2e} | " if use_scheduler else ""
+                if use_scheduler:
+                    lr_str = f"LR: {current_lr:.2e} | "
+                else:
+                    lr_str = ""
+                    
                 print_str = f"Iter {iteration+1:5d} | {lr_str}Total Loss: {loss_val:.6f} | "
+                
                 for k, v in losses.items():
                     print_str += f"{k}: {v.item():.6f} | "
+                        
                 print_str += f"Best: {self.best_loss:.6f}"
                 print(print_str)
     
@@ -2475,9 +2502,95 @@ class ParameterizedNMFSolver:
         print(f"Optimization complete!")
         print(f"Final loss: {self.loss_history[-1]:.6f}")
         print(f"Best loss: {self.best_loss:.6f} (at iteration {self.best_params['iteration']+1})")
-        print(f"Final learning rate: {current_lr:.2e}")
+        if use_scheduler:
+            print(f"Final learning rate: {current_lr:.2e}")
         
         return self.best_W, self.best_H, self.loss_history
+    
+    def solve(self, n_runs=5, n_iterations=1000, lr=0.01, 
+              print_every=10, use_scheduler=True, 
+              nmf_init=True, n_nmf_iterations=500):
+        """
+        Run optimization multiple times with different initializations and return the best result.
+        
+        Args:
+            n_runs: int - number of independent runs with different initializations
+            n_iterations: int - number of optimization iterations per run
+            lr: float - initial learning rate
+            print_every: int - print loss every N iterations (0 to disable during runs)
+            use_scheduler: bool - whether to use learning rate scheduler
+            nmf_init: bool - whether to initialize with NMF (True) or random (False)
+            n_nmf_iterations: int - number of NMF iterations for initialization (only used if nmf_init=True)
+        
+        Returns:
+            W: torch.Tensor - best W matrix
+            H: torch.Tensor - best H matrix
+            loss_history: list - loss history from the best run
+            all_results: list of dict - results from all runs for analysis
+        """
+        init_type = "NMF" if nmf_init else "random"
+        print("=" * 70)
+        print(f"Running optimization with {n_runs} different {init_type} initializations")
+        print(f"Iterations per run: {n_iterations}")
+        print("=" * 70)
+        
+        best_loss = float('inf')
+        best_W = None
+        best_H = None
+        best_loss_history = None
+        best_run_idx = -1
+        all_results = []
+        
+        for run_idx in range(n_runs):
+            print(f"\n{'='*70}")
+            print(f"RUN {run_idx + 1}/{n_runs}")
+            print(f"{'='*70}")
+            
+            # Run solve_single with specified initialization
+            W, H, loss_history = self.solve_single(
+                n_iterations=n_iterations,
+                lr=lr,
+                print_every=print_every if print_every > 0 else n_iterations + 1,  # Disable printing if 0
+                use_scheduler=use_scheduler,
+                nmf_init=nmf_init,
+                n_nmf_iterations=n_nmf_iterations
+            )
+            
+            final_loss = loss_history[-1]
+            
+            # Store results
+            all_results.append({
+                'run_idx': run_idx,
+                'final_loss': final_loss,
+                'W': W.clone(),
+                'H': H.clone(),
+                'loss_history': loss_history.copy()
+            })
+            
+            # Update best if this run is better
+            if final_loss < best_loss:
+                best_loss = final_loss
+                best_W = W.clone()
+                best_H = H.clone()
+                best_loss_history = loss_history.copy()
+                best_run_idx = run_idx
+                print(f"\n>>> New best result! Loss: {final_loss:.6f}")
+            else:
+                print(f"\nRun {run_idx + 1} final loss: {final_loss:.6f} (best: {best_loss:.6f})")
+        
+        # Final summary
+        print("\n" + "=" * 70)
+        print("MULTIPLE INITIALIZATION SUMMARY")
+        print("=" * 70)
+        print(f"Best run: {best_run_idx + 1}/{n_runs}")
+        print(f"Best final loss: {best_loss:.6f}")
+        print("\nAll runs:")
+        for i, result in enumerate(all_results):
+            marker = " <<<" if i == best_run_idx else ""
+            print(f"  Run {i+1}: {result['final_loss']:.6f}{marker}")
+        print("=" * 70)
+        
+        return best_W, best_H, best_loss_history, all_results
     
     def get_factors(self):
         """Get the best W and H matrices."""

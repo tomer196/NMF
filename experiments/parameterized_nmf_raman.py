@@ -202,8 +202,7 @@ def main():
         H_param=H_param,
         A_observed=An,
         lambda_penalty=0, # no sum-to-one penalty for Raman data
-        device=device,
-        freeze_h=True
+        device=device
     )
     
     W, H, loss_history = model.solve(

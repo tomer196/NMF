@@ -11,7 +11,7 @@ from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
 from scipy.signal import find_peaks
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from nmf.parameterized_nmf import *
+from nmf.parameterized_nmf_v2 import *
 
 prefix = "synth_v1"
 data_path = f'/Users/tomer/private/NMF/data/{prefix}/'
@@ -124,44 +124,29 @@ def main():
     # )
 
 
-    def loss_func(W, H, A_observed):
-        # Fitting term: ||A - W @ H||^2
-        A_recon = torch.mm(W, H)
-        fitting_loss = F.mse_loss(A_recon, A_observed)
-        
-        # Penalty term: encourage columns of H to sum to 1
-        # sum_penalty = lambda * mean((sum(H, dim=0) - 1)^2)
-        penalty_loss = 0.01 * torch.mean(
-            torch.square(torch.sum(H, dim=0) - 1.0)
-        )
+    # Create composite loss function
+    loss_function = CompositeLoss([
+        (FittingLoss(), 1.0, 'fitting_loss'),
+        (SumPenaltyLoss(), 0.01, 'penalty_loss', True),
+        (HFirstLoss(), 0.01, 'H_first_loss', True)
+    ],
+    )
 
-        # penalty on first time point in H should equal [1, 0, 0 ...]
-        H_first_loss = 0.01 * torch.mean(
-            torch.square(H[:, 0] - torch.eye(k_components, device=H.device)[:, 0])
-        )
-
-        total_loss = fitting_loss + penalty_loss + H_first_loss
-
-        losses = {
-            'fitting_loss': fitting_loss,
-            'penalty_loss': penalty_loss,
-            'H_first_loss': H_first_loss
-        }
-        return total_loss, losses
-    
     model = ParameterizedNMFSolver(
         W_param=W_param,
         H_param=H_param,
         A_observed=An,
-        loss_function=loss_func,
-        device=device
+        loss_function=loss_function,
+        device=device,
     )
     
-    W, H, loss_history = model.solve(
+    W, H, loss_history, _ = model.solve(
         n_iterations=10000,
         lr=0.1,
         print_every=1000,
-        nmf_init=True, 
+        nmf_init=True,
+        n_nmf_iterations=10000,
+        n_runs=5
     )
     W_param.set_params(**model.best_params['W_params'])
     H_param.set_params(**model.best_params['H_params'])
