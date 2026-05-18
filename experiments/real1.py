@@ -103,7 +103,7 @@ def main():
         mean_bounds=(0, n_wavelengths),
         std_bounds=(0.1, n_wavelengths/10),
         scale_bounds=(0, 1.0),
-        beta_bounds=(1.5, 3)
+        beta_bounds=(1.5, 2.5)
     )
     W_init = torch.zeros((n_wavelengths, k_components), device=device)
     W_init[:, 0] = An[:, 0]  # Initialize first component with first column of An
@@ -113,8 +113,8 @@ def main():
         mean_bounds=(0, n_wavelengths),
         std_bounds=(0.1, n_wavelengths/10),
         scale_bounds=(0, 1.0),
-        beta_bounds=(1.5, 3),
-        fix_mode='first',
+        beta_bounds=(1.5, 2.5),
+        fix_components=[0],
         reference_matrix=W_init
     )
     # W_param = SplineParameterization(
@@ -160,7 +160,8 @@ def main():
 
     # Create composite loss function
     loss_function = CompositeLoss([
-        (FittingLoss(), 1.0, 'fitting_loss'),
+        # (FittingLoss(), 1.0, 'fitting_loss'),
+        (RobustFittingLoss(sigma=0.7*An.max().item(), beta=20), 1.0, 'fitting_loss'),
         (SumPenaltyLoss(), 0.01, 'penalty_loss', True),
         (HFirstLoss(), 0.01, 'H_first_loss', True)
     ])

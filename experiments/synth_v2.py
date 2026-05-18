@@ -26,6 +26,7 @@ def main():
     An = torch.from_numpy(df_An.iloc[1:, 1:].values.astype(float)).to(torch.float32)
     # An += 1e-2 * torch.randn_like(An)  # Add small noise  - robustness test
     An /= 100  # Scale down An to improve optimization stability
+    # An += torch.rand_like(An) * 0.01  # Add small random noise to An for robustness test
     
     df_W_true = pd.read_csv(data_path + "W_true.csv", header=None)
     W_true = torch.from_numpy(df_W_true.iloc[1:, 1:].values.astype(float)).to(torch.float32)
@@ -69,7 +70,7 @@ def main():
     #     mean_bounds=(0, n_wavelengths),
     #     std_bounds=(0.1, n_wavelengths/10),
     #     scale_bounds=(0, 10.0),
-    #     beta_bounds=(1.5, 3)
+    #     beta_bounds=(1.5, 2.5)
     # )
     W_init = torch.zeros((n_wavelengths, k_components), device=device)
     W_init[:, 0] = An[:, 0]  # Initialize first component with first column of An
@@ -79,8 +80,8 @@ def main():
         mean_bounds=(0, n_wavelengths),
         std_bounds=(0.1, n_wavelengths/10),
         scale_bounds=(0, 5.0),
-        beta_bounds=(1.5, 3),
-        fix_mode='first',
+        beta_bounds=(1.5, 2.5),
+        fix_components=[0],
         reference_matrix=W_init
     )
     # W_param = SplineParameterization(

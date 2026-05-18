@@ -69,18 +69,21 @@ def main():
     #     mean_bounds=(0, n_wavelengths),
     #     std_bounds=(0.1, n_wavelengths/10),
     #     scale_bounds=(0, 10.0),
-    #     beta_bounds=(1.5, 3)
+    #     beta_bounds=(1.5, 2.5)
     # )
     W_init = torch.zeros((n_wavelengths, k_components), device=device)
-    W_init[:, 0] = An[:, 0]  # Initialize first component with first column of An
+    fix_components = [0]
+    W_init[:, fix_components] = W_true[:, fix_components]  # Initialize known components
+    # W_init[:, fix_components] = An[:, fix_components]  # Initialize known components
+    
     W_param = PartiallyFixedMixtureOfGeneralizedGaussiansParameterization(
         shape=(n_wavelengths, k_components), 
         n_gaussians=2,
         mean_bounds=(0, n_wavelengths),
         std_bounds=(0.1, n_wavelengths/10),
         scale_bounds=(0, 10.0),
-        beta_bounds=(1.5, 3),
-        fix_mode='first',
+        beta_bounds=(1.5, 2.5),
+        fix_components=fix_components,
         reference_matrix=W_init
     )
     # W_param = SplineParameterization(
@@ -105,10 +108,19 @@ def main():
     #     scale_bounds=(0, 1.0)
     # )
 
+    h_mean_bounds = [
+        (-0.5 * n_timepoints, 0.5 * n_timepoints),
+        (0.3 * n_timepoints, 0.7 * n_timepoints),
+        (0.5 * n_timepoints, 1 * n_timepoints),
+        (0.5 * n_timepoints, 1 * n_timepoints),
+        (0.75 * n_timepoints, 1.5 * n_timepoints),
+    ]
+
     H_param = SkewNormalParameterization(
         shape=(k_components, n_timepoints),
         axis=0,  # Row-wise for H matrix
-        mean_bounds=(-0.5*n_timepoints, 1.5*n_timepoints),
+        # mean_bounds=(-0.5*n_timepoints, 1.5*n_timepoints),
+        mean_bounds=h_mean_bounds,
         std_bounds=(0.1, n_timepoints),
         skewness_bounds=(-10.0, 10.0),
         scale_bounds=(0, 50.0)
@@ -128,7 +140,8 @@ def main():
     loss_function = CompositeLoss([
         (FittingLoss(), 1.0, 'fitting_loss'),
         (SumPenaltyLoss(), 0.01, 'penalty_loss', True),
-        (HFirstLoss(), 0.01, 'H_first_loss', True)
+        (HFirstLoss(), 0.01, 'H_first_loss', True),
+        # (HComponentLimitBeforeTimeLoss(max_k=2, t=int(0.15 * n_timepoints)), 0.01, 'H_component_limit_loss', True)
     ],
     )
 

@@ -6,11 +6,11 @@ import torch.nn.functional as F
 
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from nmf.parameterized_nmf import *
-from nmf.parameterized_nmf_raman import GaussianThresholdParameterization
+from nmf.parameterized_nmf_v2 import *
 
-data_path = '/Users/tomer/private/NMF/data/synth1/'
-out_folder = "/Users/tomer/private/NMF/out_parameterized_nmf/synth1"
+prefix = "synth_v1"
+data_path = f'/Users/tomer/private/NMF/data/{prefix}/'
+out_folder = f"/Users/tomer/private/NMF/out_parameterized_nmf/{prefix}"
 os.makedirs(out_folder, exist_ok=True)
 
 def test_vis():
@@ -91,7 +91,10 @@ def test():
     W_true /= 100.0  # Scale down W_true to improve optimization stability
     
     df_H_true = pd.read_csv(data_path + "H_true.csv", header=None)
-    H_true = torch.from_numpy(df_H_true.iloc[1:, 2:].values.astype(float)).to(torch.float32)
+    try:
+        H_true = torch.from_numpy(df_H_true.iloc[1:, 1:].values.astype(float)).to(torch.float32)
+    except:
+        H_true = torch.from_numpy(df_H_true.iloc[1:, 2:].values.astype(float)).to(torch.float32)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nUsing device: {device}")
@@ -114,12 +117,11 @@ def test():
     # )
     W_param = MixtureOfGeneralizedGaussiansParameterization(
         shape=(n_wavelengths, k_components), 
-        n_gaussians=3,
-        axis=1,  # Column-wise for W matrix
+        n_gaussians=2,
         mean_bounds=(0, n_wavelengths),
-        std_bounds=(10, n_wavelengths/10),
+        std_bounds=(0.1, n_wavelengths/10),
         scale_bounds=(0, 10.0),
-        beta_bounds=(1.5, 3)
+        beta_bounds=(1.5, 2.5),
     )
     # W_param = SplineParameterization(
     #     shape=(n_wavelengths, k_components), 
@@ -155,11 +157,11 @@ def test():
     # plot_results(W_param, H_param, An, W_true, H_true, wavelengths, prefix='initial')
 
 
-    # W_param.initialize_from_matrix(W_true)
+    W_param.initialize_from_matrix(W_true)
     H_param.initialize_from_matrix(H_true)
-    # print(W_param)
+    print(W_param)
     # print(H_param)
-    plot_results(W_param, H_param, An, W_true, H_true, wavelengths, prefix='fit')
+    plot_results(W_param, H_param, An, W_true, H_true, wavelengths, prefix='fit',out_folder=out_folder)
 
 
     

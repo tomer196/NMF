@@ -1481,15 +1481,15 @@ class MixtureOfGeneralizedGaussiansParameterization(MatrixParameterization):
 
 class PartiallyFixedMixtureOfGeneralizedGaussiansParameterization(MixtureOfGeneralizedGaussiansParameterization):
     """
-    Mixture of Generalized Gaussians with some columns fixed from a reference matrix.
+    Mixture of Generalized Gaussians with arbitrary columns fixed from a reference matrix.
     Only supports axis=1 (column-wise).
     
     Args:
-        fix_mode: str - 'first' to fix first column, 'first_and_last' to fix first and last columns
+        fix_components: List[int] - indices of columns to fix
         reference_matrix: torch.Tensor - reference matrix to extract fixed column parameters from
     """
     def __init__(self, shape, n_gaussians=2, mean_bounds=None, std_bounds=None, 
-                 beta_bounds=None, scale_bounds=None, fix_mode='first', reference_matrix=None):
+                 beta_bounds=None, scale_bounds=None, fix_components=None, reference_matrix=None):
         """
         Initialize with some columns fixed.
         
@@ -1497,15 +1497,15 @@ class PartiallyFixedMixtureOfGeneralizedGaussiansParameterization(MixtureOfGener
             shape: tuple (n_rows, n_cols) - shape of the matrix to generate
             n_gaussians: int - number of Generalized Gaussians in the mixture
             mean_bounds, std_bounds, beta_bounds, scale_bounds: parameter bounds
-            fix_mode: str - 'first' or 'first_and_last'
+            fix_components: List[int] - indices of columns to fix
             reference_matrix: torch.Tensor - matrix to extract fixed parameters from
         """
         if reference_matrix is None:
             raise ValueError("reference_matrix must be provided")
-        
-        self.fix_mode = fix_mode
+        if fix_components is None:
+            fix_components = []
+        self.fix_components = list(sorted(set(fix_components)))
         self.reference_matrix = reference_matrix
-        
         # Initialize parent (axis is always 1 for this class)
         super().__init__(shape, n_gaussians=n_gaussians, axis=1, 
                         mean_bounds=mean_bounds, std_bounds=std_bounds,
@@ -1514,7 +1514,6 @@ class PartiallyFixedMixtureOfGeneralizedGaussiansParameterization(MixtureOfGener
     def _init_params(self):
         """Initialize parameters with some columns fixed."""
         # Create a temporary parent class instance to fit the reference matrix
-        # This gives us the full optimization benefit
         temp_param = MixtureOfGeneralizedGaussiansParameterization(
             shape=self.shape,
             n_gaussians=self.n_gaussians,
@@ -1524,42 +1523,33 @@ class PartiallyFixedMixtureOfGeneralizedGaussiansParameterization(MixtureOfGener
             beta_bounds=self.beta_bounds,
             scale_bounds=self.scale_bounds
         )
-        
-        # Fit it to the reference matrix (includes peak-finding + optimization)
         temp_param.initialize_from_matrix(self.reference_matrix)
-        
-        # Extract the optimized parameters
         n_components = self.n_cols
         means_data = temp_param.means_unconstrained.data.clone()
         stds_data = temp_param.stds_unconstrained.data.clone()
         beta_data = temp_param.beta_unconstrained.data.clone()
         scales_data = temp_param.scales_unconstrained.data.clone()
-        
         # Store bounds (they were set by temp_param)
         self.mean_bounds = temp_param.mean_bounds
         self.std_bounds = temp_param.std_bounds
         self.beta_bounds = temp_param.beta_bounds
         self.scale_bounds = temp_param.scale_bounds
-        
         # Determine which columns to fix
-        if self.fix_mode == 'first':
-            fixed_indices = [0]
-            learnable_indices = list(range(1, n_components))
-        elif self.fix_mode == 'first_and_last':
-            fixed_indices = [0, n_components - 1]
-            learnable_indices = list(range(1, n_components - 1))
-        else:
-            raise ValueError(f"Unknown fix_mode: {self.fix_mode}")
-        
+        fixed_indices = self.fix_components
+        learnable_indices = [i for i in range(n_components) if i not in fixed_indices]
         self.fixed_indices = fixed_indices
         self.learnable_indices = learnable_indices
-        
         # Register fixed columns as buffers (non-trainable)
-        self.register_buffer('means_fixed', means_data[fixed_indices])
-        self.register_buffer('stds_fixed', stds_data[fixed_indices])
-        self.register_buffer('beta_fixed', beta_data[fixed_indices])
-        self.register_buffer('scales_fixed', scales_data[fixed_indices])
-        
+        if len(fixed_indices) > 0:
+            self.register_buffer('means_fixed', means_data[fixed_indices])
+            self.register_buffer('stds_fixed', stds_data[fixed_indices])
+            self.register_buffer('beta_fixed', beta_data[fixed_indices])
+            self.register_buffer('scales_fixed', scales_data[fixed_indices])
+        else:
+            self.register_buffer('means_fixed', torch.empty((0, self.n_gaussians)))
+            self.register_buffer('stds_fixed', torch.empty((0, self.n_gaussians)))
+            self.register_buffer('beta_fixed', torch.empty((0, self.n_gaussians)))
+            self.register_buffer('scales_fixed', torch.empty((0, self.n_gaussians)))
         # Create parameters for learnable columns (requires_grad=True)
         if len(learnable_indices) > 0:
             self.means_unconstrained = nn.Parameter(2 * (torch.rand(len(learnable_indices), self.n_gaussians) - 0.5))
@@ -1567,7 +1557,6 @@ class PartiallyFixedMixtureOfGeneralizedGaussiansParameterization(MixtureOfGener
             self.beta_unconstrained = nn.Parameter(2 * (torch.rand(len(learnable_indices), self.n_gaussians) - 0.5))
             self.scales_unconstrained = nn.Parameter(2 * (torch.rand(len(learnable_indices), self.n_gaussians) - 0.5))
         else:
-            # All columns fixed
             self.means_unconstrained = None
             self.stds_unconstrained = None
             self.beta_unconstrained = None
@@ -1576,21 +1565,17 @@ class PartiallyFixedMixtureOfGeneralizedGaussiansParameterization(MixtureOfGener
     def forward(self):
         """Generate matrix by combining fixed and learnable columns, then calling parent's computation."""
         n_components = self.n_cols
-        device = self.means_fixed.device
-        
-        # Reconstruct full parameter tensors
+        device = self.reference_matrix.device if hasattr(self.reference_matrix, 'device') else torch.device('cpu')
         full_means = torch.zeros(n_components, self.n_gaussians, device=device)
         full_stds = torch.zeros(n_components, self.n_gaussians, device=device)
         full_beta = torch.zeros(n_components, self.n_gaussians, device=device)
         full_scales = torch.zeros(n_components, self.n_gaussians, device=device)
-        
         # Fill fixed columns from buffers
         for i, idx in enumerate(self.fixed_indices):
             full_means[idx] = self.means_fixed[i]
             full_stds[idx] = self.stds_fixed[i]
             full_beta[idx] = self.beta_fixed[i]
             full_scales[idx] = self.scales_fixed[i]
-        
         # Fill learnable columns from parameters
         if self.means_unconstrained is not None:
             for i, idx in enumerate(self.learnable_indices):
@@ -1598,21 +1583,15 @@ class PartiallyFixedMixtureOfGeneralizedGaussiansParameterization(MixtureOfGener
                 full_stds[idx] = self.stds_unconstrained[i]
                 full_beta[idx] = self.beta_unconstrained[i]
                 full_scales[idx] = self.scales_unconstrained[i]
-        
         # Temporarily assign full tensors and call parent's forward logic
-        # (copying parent's forward computation to avoid attribute replacement issues)
         mean_min, mean_max = self.mean_bounds
         means = mean_min + (mean_max - mean_min) * torch.sigmoid(full_means)
-        
         std_min, std_max = self.std_bounds
         stds = std_min + (std_max - std_min) * torch.sigmoid(full_stds) + 1e-6
-        
         beta_min, beta_max = self.beta_bounds
         beta = beta_min + (beta_max - beta_min) * torch.sigmoid(full_beta)
-        
         scale_min, scale_max = self.scale_bounds
         scales = scale_min + (scale_max - scale_min) * torch.sigmoid(full_scales)
-        
         # Column-wise computation (axis=1)
         x = torch.arange(self.n_rows, dtype=torch.float32, device=device)
         x = x.unsqueeze(1).unsqueeze(1)  # Shape: (n_rows, 1, 1)
@@ -1620,12 +1599,9 @@ class PartiallyFixedMixtureOfGeneralizedGaussiansParameterization(MixtureOfGener
         stds = stds.unsqueeze(0)
         beta = beta.unsqueeze(0)
         scales = scales.unsqueeze(0)
-        
-        # Generalized Gaussian computation
         abs_diff = torch.abs(x - means)
         gaussians = scales * torch.exp(-0.5 * ((abs_diff / stds) ** beta))
         matrix = torch.sum(gaussians, dim=2)
-        
         return matrix
     
     def initialize_from_matrix(self, target_matrix):
@@ -1633,17 +1609,11 @@ class PartiallyFixedMixtureOfGeneralizedGaussiansParameterization(MixtureOfGener
         if self.means_unconstrained is None:
             # All columns are fixed, nothing to initialize
             return
-        
-        # Use parent's initialization logic only for learnable columns
         from scipy.signal import find_peaks
         target_matrix_np = target_matrix.detach().cpu().numpy()
         axis_size = self.n_rows
-        
         for i, col_idx in enumerate(self.learnable_indices):
-            # Extract data for this learnable column
             data = target_matrix_np[:, col_idx]
-            
-            # Find local maxima
             peaks, _ = find_peaks(data)
             if len(peaks) < self.n_gaussians:
                 additionale_data = np.copy(data)
@@ -1652,27 +1622,19 @@ class PartiallyFixedMixtureOfGeneralizedGaussiansParameterization(MixtureOfGener
                 peaks = np.concatenate([peaks, additional_peaks])
             else:
                 peaks = peaks[np.argsort(data[peaks])][-self.n_gaussians:]
-            
             means_init = peaks
             std_value = axis_size / 10.0
             stds_init = np.full(self.n_gaussians, std_value)
             scales_init = data[peaks]
             beta_init = np.full(self.n_gaussians, 2.0)
-            
-            # Update learnable parameters (i is the index in the learnable parameter tensors)
             means_ratio = np.clip((means_init - self.mean_bounds[0]) / (self.mean_bounds[1] - self.mean_bounds[0]), 1e-7, 1 - 1e-7)
             self.means_unconstrained.data[i] = torch.from_numpy(np.log(means_ratio / (1 - means_ratio))).float()
-            
             stds_ratio = np.clip((stds_init - self.std_bounds[0]) / (self.std_bounds[1] - self.std_bounds[0]), 1e-7, 1 - 1e-7)
             self.stds_unconstrained.data[i] = torch.from_numpy(np.log(stds_ratio / (1 - stds_ratio))).float()
-            
             beta_ratio = np.clip((beta_init - self.beta_bounds[0]) / (self.beta_bounds[1] - self.beta_bounds[0]), 1e-7, 1 - 1e-7)
             self.beta_unconstrained.data[i] = torch.from_numpy(np.log(beta_ratio / (1 - beta_ratio))).float()
-            
             scales_ratio = np.clip((scales_init - self.scale_bounds[0]) / (self.scale_bounds[1] - self.scale_bounds[0]), 1e-7, 1 - 1e-7)
             self.scales_unconstrained.data[i] = torch.from_numpy(np.log(scales_ratio / (1 - scales_ratio))).float()
-        
-        # Call base class method for additional optimization
         MatrixParameterization.initialize_from_matrix(self, target_matrix)
 
 class SkewNormalParameterization(MatrixParameterization):
@@ -1706,6 +1668,33 @@ class SkewNormalParameterization(MatrixParameterization):
         self.std_bounds = std_bounds
         self.scale_bounds = scale_bounds
         super(SkewNormalParameterization, self).__init__(shape)
+
+    def _mean_bounds_are_per_component(self):
+        """Return True when mean_bounds is provided as one (min, max) pair per component."""
+        if self.mean_bounds is None:
+            return False
+        if isinstance(self.mean_bounds, torch.Tensor):
+            return self.mean_bounds.ndim == 2 and self.mean_bounds.shape[-1] == 2
+        if isinstance(self.mean_bounds, np.ndarray):
+            return self.mean_bounds.ndim == 2 and self.mean_bounds.shape[-1] == 2
+        return (
+            isinstance(self.mean_bounds, (list, tuple))
+            and len(self.mean_bounds) > 0
+            and isinstance(self.mean_bounds[0], (list, tuple, np.ndarray, torch.Tensor))
+        )
+
+    def _get_mean_bounds(self, device=None):
+        """Return mean bounds as either scalars or per-component tensors."""
+        if not self._mean_bounds_are_per_component():
+            return self.mean_bounds
+
+        bounds = torch.as_tensor(self.mean_bounds, dtype=torch.float32, device=device)
+        expected_components = self.n_cols if self.axis == 1 else self.n_rows
+        if bounds.shape != (expected_components, 2):
+            raise ValueError(
+                f"mean_bounds must have shape ({expected_components}, 2) when provided per component; got {tuple(bounds.shape)}"
+            )
+        return bounds[:, 0], bounds[:, 1]
     
     def _init_params(self):
         """Initialize unconstrained Skew-Normal parameters."""
@@ -1758,7 +1747,11 @@ class SkewNormalParameterization(MatrixParameterization):
     def forward(self):
         """Generate matrix where each column/row is a Skew-Normal distribution."""
         # Transform parameters
-        location_min, location_max = self.mean_bounds
+        location_bounds = self._get_mean_bounds(device=self.location_unconstrained.device)
+        if self._mean_bounds_are_per_component():
+            location_min, location_max = location_bounds
+        else:
+            location_min, location_max = location_bounds
         location = location_min + (location_max - location_min) * torch.sigmoid(self.location_unconstrained)
         
         scale_min, scale_max = self.std_bounds
@@ -1803,7 +1796,11 @@ class SkewNormalParameterization(MatrixParameterization):
     
     def __repr__(self):
         """String representation showing constrained parameter values."""
-        location_min, location_max = self.mean_bounds
+        location_bounds = self._get_mean_bounds(device=self.location_unconstrained.device)
+        if self._mean_bounds_are_per_component():
+            location_min, location_max = location_bounds
+        else:
+            location_min, location_max = location_bounds
         location = location_min + (location_max - location_min) * torch.sigmoid(self.location_unconstrained)
         scale_min, scale_max = self.std_bounds
         scale = scale_min + (scale_max - scale_min) * torch.sigmoid(self.scale_unconstrained)
@@ -1867,7 +1864,11 @@ class SkewNormalParameterization(MatrixParameterization):
                 skewness_init = 0.0
             
             # Apply inverse sigmoid transformation
-            location_ratio = np.clip((location_init - self.mean_bounds[0]) / (self.mean_bounds[1] - self.mean_bounds[0]), 1e-7, 1 - 1e-7)
+            if self._mean_bounds_are_per_component():
+                location_min, location_max = self.mean_bounds[idx]
+            else:
+                location_min, location_max = self.mean_bounds
+            location_ratio = np.clip((location_init - location_min) / (location_max - location_min), 1e-7, 1 - 1e-7)
             self.location_unconstrained.data[idx] = torch.tensor(np.log(location_ratio / (1 - location_ratio)), dtype=torch.float32)
             
             scale_ratio = np.clip((scale_init - self.std_bounds[0]) / (self.std_bounds[1] - self.std_bounds[0]), 1e-7, 1 - 1e-7)
@@ -2152,6 +2153,29 @@ class FittingLoss(LossFunction):
         return F.mse_loss(A_recon, A_observed)
 
 
+class RobustFittingLoss(LossFunction):
+    """
+    Noise-robust fitting loss: softplus(mse - sigma^2)
+
+    For residuals below the noise floor sigma^2 the gradient is near-zero,
+    so the optimiser is not penalised for noise-level deviations.
+    Above the noise floor it recovers standard MSE behaviour.
+
+    Args:
+        sigma: float - expected noise standard deviation
+    """
+
+    def __init__(self, sigma: float, beta: float = 20.0):
+        self.sigma = float(sigma)
+        self.beta = float(beta)
+
+    def forward(self, W: torch.Tensor, H: torch.Tensor, A_observed: torch.Tensor,
+                iteration: int, total_iterations: int) -> torch.Tensor:
+        A_recon = torch.mm(W, H)
+        mse = F.mse_loss(A_recon, A_observed)
+        return F.softplus(mse - self.sigma ** 2, beta=self.beta)
+
+
 class SumPenaltyLoss(LossFunction):
     """
     Sum penalty loss: encourages columns of H to sum to 1.
@@ -2180,6 +2204,33 @@ class HFirstLoss(LossFunction):
         k_components = H.shape[0]
         target = torch.eye(k_components, device=H.device)[:, 0]
         return torch.mean(torch.square(H[:, 0] - target))
+
+
+class HComponentLimitBeforeTimeLoss(LossFunction):
+    """
+    Penalize H components above a cutoff index before a chosen time.
+
+    If max_k = 1 and t = 10, then components 1..end are penalized whenever
+    they deviate from zero in H[:, :10].
+    """
+
+    def __init__(self, max_k: int, t: int):
+        self.max_k = int(max_k)
+        self.t = int(t)
+
+    def forward(self, W: torch.Tensor, H: torch.Tensor, A_observed: torch.Tensor,
+                iteration: int, total_iterations: int) -> torch.Tensor:
+        """Penalize components above max_k before time t."""
+        if H.dim() != 2:
+            raise ValueError("HComponentLimitBeforeTimeLoss expects H to be a 2D tensor")
+
+        time_limit = max(0, min(self.t, H.shape[1]))
+        component_limit = max(0, min(self.max_k, H.shape[0]))
+
+        if time_limit == 0 or component_limit >= H.shape[0]:
+            return H.new_tensor(0.0)
+
+        return torch.mean(torch.square(H[component_limit:, :time_limit]))
 
 
 class CompositeLoss(LossFunction):
@@ -2383,7 +2434,15 @@ class ParameterizedNMFSolver:
         
         # Use best iteration
         print(f"\nNMF initialization complete. Best loss: {best_loss:.6f} at iteration {best_iteration+1}/{n_nmf_iterations}")
-        
+
+        # --- Sort components by peak position in H_init ---
+        # Find peak (argmax) for each component (row) in H_init
+        peak_indices = torch.argmax(best_H_init, dim=1)
+        sort_order = torch.argsort(peak_indices)
+        # Sort W_init and H_init columns/rows accordingly
+        best_W_init = best_W_init[:, sort_order]
+        best_H_init = best_H_init[sort_order, :]
+
         # Initialize parameterizations from best NMF result
         print("Fitting parameterization to best NMF solution...")
         self.W_param.initialize_from_matrix(best_W_init)
